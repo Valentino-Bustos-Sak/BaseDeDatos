@@ -13,7 +13,7 @@ mongo_client = MongoClient("mongodb+srv://basededatos.dpkfoeh.mongodb.net/?...",
 mongo_db = mongo_client["mi_red_social"]
 
 # Conexión a Neo4j (Grafo de Interacciones)
-neo4j_driver = GraphDatabase.driver("neo4j://localhost:7687", auth=("neo4j", "tu_password"))
+neo4j_driver = GraphDatabase.driver("neo4j://localhost:7687", auth=("neo4j", "xilqil50xbAWE1kZ"))
 
 # Conexión a Supabase (SQL Transaccional y Data Warehouse)
 # Nota: Supabase usa PostgreSQL por detrás.
