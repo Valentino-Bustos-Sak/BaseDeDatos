@@ -1,9 +1,12 @@
+from dotenv import load_dotenv
+import os
 import pandas as pd
 from sqlalchemy import create_engine, text
 import urllib.parse
 
-PASS_DWH_TEXTO = "Datawarehouse.vbs"
-PASS_SOURCE_TEXTO  = "Datamart.vbs"
+load_dotenv()
+PASS_DWH_TEXTO = os.getenv("PASS_DWH")
+PASS_SOURCE_TEXTO  = os.getenv("PASS_SOURCE")
 
 pass_dwh_segura = urllib.parse.quote_plus(PASS_DWH_TEXTO)
 pass_source_segura  = urllib.parse.quote_plus(PASS_SOURCE_TEXTO)
