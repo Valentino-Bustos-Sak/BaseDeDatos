@@ -11,8 +11,8 @@ load_dotenv()  # Levanta el archivo .env
 PASSWORD_DM = os.getenv("Supa_Password_DM")
 PASSWORD_DW = os.getenv("Supa_Password_DW")
 
-URL_DATAWAREHOUSE = "postgresql://postgres.gjpqfmnbabmjohobaxfv:{PASSWORD_DW}@aws-1-us-east-1.pooler.supabase.com:6543/postgres?pgbouncer=true"
-URL_DATAMART      = "postgresql://postgres.nksiwgmgejhbkyyftnub:{PASSWORD_DM}@aws-1-us-east-2.pooler.supabase.com:6543/postgres?pgbouncer=true"
+URL_DATAWAREHOUSE = f"postgresql://postgres.gjpqfmnbabmjohobaxfv:{PASSWORD_DW}@aws-1-us-east-1.pooler.supabase.com:6543/postgres?options=-c%20project=gjpqfmnbabmjohobaxfv"
+URL_DATAMART      = f"postgresql://postgres.nksiwgmgejhbkyyftnub:{PASSWORD_DM}@aws-1-us-east-2.pooler.supabase.com:6543/postgres?options=-c%20project=nksiwgmgejhbkyyftnub"
 
 engine_dwh = create_engine(URL_DATAWAREHOUSE)
 engine_mart = create_engine(URL_DATAMART)
