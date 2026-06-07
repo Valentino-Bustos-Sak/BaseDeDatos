@@ -1,0 +1,278 @@
+import os
+import sys
+import urllib.parse
+from pathlib import Path
+import pandas as pd
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+from pymongo import MongoClient
+from neo4j import GraphDatabase
+
+# ============================================================================
+# 📁 CONFIGURACIÓN DE RUTAS E IMPORTS MODULARES
+# ============================================================================
+ruta_raiz = "/workspaces/BaseDeDatos"
+if ruta_raiz not in sys.path:
+    sys.path.append(ruta_raiz)
+
+from funciones.obtener_geografia_offline import obtener_geografia_offline
+
+# Carga de variables de entorno (.env)
+ruta_env = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=ruta_env)
+
+# ============================================================================
+# 🔌 CONEXIONES A LAS BASES DE DATOS
+# ============================================================================
+PASS_DWH_TEXTO = os.getenv("PASS_DWH")
+PASS_SOURCE_TEXTO = os.getenv("PASS_SOURCE")
+PASS_MONGO_BASE = os.getenv("PASS_MONGO")
+password_neo = os.getenv("NEO4J_PASSWORD")
+
+pass_dwh_segura = urllib.parse.quote_plus(PASS_DWH_TEXTO)
+pass_source_segura = urllib.parse.quote_plus(PASS_SOURCE_TEXTO)
+pass_mongo_segura = urllib.parse.quote_plus(PASS_MONGO_BASE)
+
+URL_DATAWAREHOUSE = f"postgresql://postgres.gjpqfmnbabmjohobaxfv:{pass_dwh_segura}@aws-1-us-east-1.pooler.supabase.com:6543/postgres?options=-c%20project=gjpqfmnbabmjohobaxfv"
+URL_SOURCE = f"postgresql://postgres.nksiwgmgejhbkyyftnub:{pass_source_segura}@aws-1-us-east-2.pooler.supabase.com:6543/postgres?options=-c%20project=nksiwgmgejhbkyyftnub"
+
+engine_source = create_engine(URL_SOURCE)
+engine_dwh = create_engine(URL_DATAWAREHOUSE)
+
+def etl_creacion():
+    # ------------------------------------------------------------------------
+    # 📥 1. EXTRACCIÓN (Extract)
+    # ------------------------------------------------------------------------
+    print("📥 Extrayendo datos de las fuentes...")
+    querys = {
+        "usuario": "SELECT * FROM usuario",
+        "geografia": "SELECT * FROM geografia",
+        "metodo_facturacion": "SELECT * FROM metodo_facturacion",
+        "factura": "SELECT * FROM factura"
+    }
+    
+    with engine_source.connect() as conn:
+        df_usuario = pd.read_sql(text(querys["usuario"]), con=conn)
+        df_geografia = pd.read_sql(text(querys["geografia"]), con=conn)
+        df_metodo = pd.read_sql(text(querys["metodo_facturacion"]), con=conn)
+        df_factura = pd.read_sql(text(querys["factura"]), con=conn)
+
+    # Extracción MongoDB Atlas
+    client_mongo = MongoClient(f"mongodb+srv://vbustossak_db_user:{pass_mongo_segura}@basededatos.dpkfoeh.mongodb.net/?appName=BaseDeDatos")  
+    db = client_mongo["<Publicacion>"]
+    coleccion = db["posts"]
+    cursor = coleccion.find({})
+    datos = []
+    for doc in cursor:
+        datos.append({
+            "id_publicacion": str(doc["_id"]),
+            "descripcion": doc.get("text"),
+            "longitud_caracteres": len(doc.get("text", "")) if doc.get("text") else 0,
+            "tema": doc.get("category"),
+            "tiene_imagen": bool(doc.get("imagen", False)),
+            "tiene_video": bool(doc.get("video", False))
+        })
+    df_mongo = pd.DataFrame(datos)
+    client_mongo.close()
+    
+    # Extracción Neo4j AuraDB
+    driver = GraphDatabase.driver("neo4j+s://42a291ac.databases.neo4j.io", auth=("42a291ac", password_neo))
+    query_cypher = """
+    MATCH (u:Usuario)-[r:PUBLICO|LIKEO|REPOSTEO]->(p:Publicacion)
+    RETURN elementId(r) AS id_actividad,
+           u.usuario_id AS id_usuario_fk,
+           p.publicacion_id AS id_publicacion_fk,
+           type(r) AS tipo_actividad,
+           r.dispositivo AS dispositivo,
+           r.latitud AS latitud,
+           r.longitud AS longitud,
+           r.fecha AS fecha_actividad
+    """
+    with driver.session() as session:
+        result = session.run(query_cypher)
+        df_neo = pd.DataFrame([record.data() for record in result])
+    driver.close()
+    print(len(df_neo))
+    
+    # ------------------------------------------------------------------------
+    # 🔄 2. TRANSFORMACIÓN Y CARGA DE DIMENSIONES (Transform & Load)
+    # ------------------------------------------------------------------------
+    with engine_dwh.connect() as conn_dwh:
+        print("⚙️ Procesando y cargando dimensiones estáticas...")
+        usuarios_viejos = pd.read_sql(text("SELECT id_usuario FROM usuario"), con=conn_dwh)["id_usuario"].tolist()
+        df_usuario_nuevo = df_usuario[~df_usuario["id_usuario"].isin(usuarios_viejos)]
+        if not df_usuario_nuevo.empty:
+            df_usuario_nuevo.to_sql("usuario", con=conn_dwh, if_exists="append", index=False)       
+
+        metodos_viejos = pd.read_sql(text("SELECT id_metodo_facturacion FROM metodo_facturacion"), con=conn_dwh)["id_metodo_facturacion"].tolist()
+        df_metodo_nuevo = df_metodo[~df_metodo["id_metodo_facturacion"].isin(metodos_viejos)]
+        if not df_metodo_nuevo.empty:
+            df_metodo_nuevo["metodo_pago"] = df_metodo_nuevo["metodo_pago"].astype(str).str.strip().str.lower()
+            df_metodo_nuevo.to_sql("metodo_facturacion", con=conn_dwh, if_exists="append", index=False)
+
+        df_neo[['pais', 'region', 'ciudad', 'codigo_iso']] = [
+            obtener_geografia_offline(lat, lon) for lat, lon in zip(df_neo['latitud'], df_neo['longitud'])
+        ]
+        df_geo_neo4j_final = df_neo[['pais', 'region', 'ciudad', 'codigo_iso']].drop_duplicates().copy()
+        
+        df_geografia_unificada = pd.concat([df_geografia, df_geo_neo4j_final], ignore_index=True)
+        df_geografia_unificada.drop_duplicates(subset=['pais', 'region', 'ciudad', 'codigo_iso'], inplace=True)
+        geo_viejas_df = pd.read_sql(text("SELECT id_geografia, pais, region, ciudad FROM geografia"), con=conn_dwh)
+        df_geo_merge = df_geografia_unificada.merge(geo_viejas_df, on=['pais', 'region', 'ciudad'], how='left', suffixes=('', '_old'))
+        df_geo_nuevo = df_geo_merge[df_geo_merge['id_geografia'].isna()].copy()
+        if not df_geo_nuevo.empty:
+            if 'id_geografia' in df_geo_nuevo.columns:
+                df_geo_nuevo.drop(columns=['id_geografia'], inplace=True)
+            
+            max_id_geo = geo_viejas_df['id_geografia'].max() if not geo_viejas_df.empty else 0
+            df_geo_nuevo.insert(0, 'id_geografia', range(int(max_id_geo) + 1, int(max_id_geo) + 1 + len(df_geo_nuevo)))
+            
+            df_geo_nuevo = df_geo_nuevo[['id_geografia', 'pais', 'region', 'ciudad', 'codigo_iso']]
+            df_geo_nuevo.to_sql("geografia", con=conn_dwh, if_exists="append", index=False)
+
+        df_geografia_unificada_completa = pd.read_sql(text("SELECT id_geografia, pais, region, ciudad FROM geografia"), con=conn_dwh)
+
+        # Dimensión Tiempo (Clave Subrogada Autoincremental 1 a N)
+        print("⏳ Estructurando dimensión tiempo...")
+        fechas_facturas = pd.to_datetime(df_factura["fecha_alta"])
+        
+        fechas_actividades_limpias = df_neo["fecha_actividad"].apply(
+            lambda x: x.to_native() if hasattr(x, "to_native") else x
+        )
+        fechas_actividades = pd.to_datetime(fechas_actividades_limpias, utc=True)
+        
+        todas_las_fechas = pd.concat([fechas_facturas, fechas_actividades]).dropna()
+        todas_las_fechas = pd.to_datetime(todas_las_fechas, utc=True)
+        fechas_truncadas = todas_las_fechas.dt.floor("h").drop_duplicates()    
+        
+        dim_tiempo_candidata = pd.DataFrame({
+            "id_tiempo": fechas_truncadas.dt.strftime("%Y%m%d%H").astype(int),
+            "fecha": fechas_truncadas.dt.tz_localize(None),
+            "anio": fechas_truncadas.dt.year,
+            "trimestre": fechas_truncadas.dt.quarter,
+            "mes": fechas_truncadas.dt.month,
+            "dia": fechas_truncadas.dt.day,
+            "dia_semana": fechas_truncadas.dt.dayofweek + 1,
+            "hora": fechas_truncadas.dt.hour
+        }).drop_duplicates(subset=["id_tiempo"])
+
+        tiempos_viejos = pd.read_sql(text("SELECT id_tiempo FROM tiempo"), con=conn_dwh)["id_tiempo"].tolist()
+        dim_tiempo_nueva = dim_tiempo_candidata[~dim_tiempo_candidata["id_tiempo"].isin(tiempos_viejos)]
+        if not dim_tiempo_nueva.empty:
+            dim_tiempo_nueva.to_sql("tiempo", con=conn_dwh, if_exists="append", index=False)
+    
+        dim_dispositivo_viejos = pd.read_sql(text("SELECT tipo FROM dispositivo"), con=conn_dwh)["tipo"].tolist()
+        nuevos_dispositivos = [d for d in df_neo["dispositivo"].dropna().unique() if d not in dim_dispositivo_viejos]
+        if nuevos_dispositivos:
+            max_id_disp = pd.read_sql(text("SELECT COALESCE(MAX(id_dispositivo), 0) as m FROM dispositivo"), con=conn_dwh)['m'].iloc[0]
+            dim_dispositivo_nuevo = pd.DataFrame({"tipo": nuevos_dispositivos})
+            dim_dispositivo_nuevo.insert(0, "id_dispositivo", range(int(max_id_disp) + 1, int(max_id_disp) + 1 + len(dim_dispositivo_nuevo)))
+            dim_dispositivo_nuevo.to_sql("dispositivo", con=conn_dwh, if_exists="append", index=False)
+
+        dim_dispositivo_completa = pd.read_sql(text("SELECT id_dispositivo, tipo FROM dispositivo"), con=conn_dwh)
+
+        dim_tipo_viejos = pd.read_sql(text("SELECT descripcion FROM tipo_actividad"), con=conn_dwh)["descripcion"].tolist()
+        nuevas_actividades = [a.lower() for a in df_neo["tipo_actividad"].dropna().unique() if a.lower() not in dim_tipo_viejos]
+        if nuevas_actividades:
+            max_id_tipo = pd.read_sql(text("SELECT COALESCE(MAX(id_tipo_actividad), 0) as m FROM tipo_actividad"), con=conn_dwh)['m'].iloc[0]
+            dim_tipo_nuevo = pd.DataFrame({"descripcion": nuevas_actividades})
+            dim_tipo_nuevo.insert(0, "id_tipo_actividad", range(int(max_id_tipo) + 1, int(max_id_tipo) + 1 + len(dim_tipo_nuevo)))
+            dim_tipo_nuevo.to_sql("tipo_actividad", con=conn_dwh, if_exists="append", index=False)
+            print(f"  ✓ {len(dim_tipo_nuevo)} etiquetas de actividad nuevas añadidas.")
+            
+        dim_tipo_actividad_completa = pd.read_sql(text("SELECT id_tipo_actividad, descripcion FROM tipo_actividad"), con=conn_dwh)
+        # Dimensión Publicación (MongoDB)
+        publicaciones_viejas = pd.read_sql(text("SELECT id_publicacion FROM publicacion"), con=conn_dwh)["id_publicacion"].tolist()
+        df_mongo_nuevo = df_mongo[~df_mongo["id_publicacion"].isin(publicaciones_viejas)].drop_duplicates(subset=["id_publicacion"])
+        if not df_mongo_nuevo.empty:
+            df_mongo_nuevo.to_sql("publicacion", schema="public", con=conn_dwh, if_exists="append", index=False)
+            print(f"  ✓ {len(df_mongo_nuevo)} posts nuevos importados de MongoDB.")
+            
+        df_publicacion_completa = pd.read_sql(text("SELECT id_publicacion FROM publicacion"), con=conn_dwh)
+
+        facturas_viejas = pd.read_sql("SELECT id_factura FROM factura", con=conn_dwh)["id_factura"].tolist()
+        df_factura_nueva = df_factura[~df_factura["id_factura"].isin(facturas_viejas)].copy()
+        
+        if not df_factura_nueva.empty:
+            df_factura_nueva["id_tiempo_fk"] = pd.to_datetime(df_factura_nueva["fecha_alta"]).dt.strftime("%Y%m%d%H").astype(int)
+            hechos_factura = df_factura_nueva[[
+                "id_factura", "id_metodo_fk", "id_geografia_fk", 
+                "id_usuario_fk", "id_tiempo_fk", "duracion", "monto"
+            ]]
+            hechos_factura.to_sql("factura", con=conn_dwh, if_exists="append", index=False)
+            print(f"  🚀 [HECHOS] Se añadieron {len(hechos_factura)} facturas nuevas.")
+        else:
+            print("  📊 [HECHOS] No se detectaron facturas nuevas.")
+
+        # --- Hechos Actividad ---
+        actividades_viejas = pd.read_sql(text("SELECT id_actividad FROM actividad"), con=conn_dwh)["id_actividad"].tolist()
+        df_neo_nuevo = df_neo[~df_neo["id_actividad"].isin(actividades_viejas)].copy()
+        print(len(df_neo_nuevo))
+        if not df_neo_nuevo.empty:
+            df_neo_nuevo["tipo_actividad"] = df_neo_nuevo["tipo_actividad"].str.lower()
+            df_neo_nuevo["id_tiempo_fk"] = pd.to_datetime(fechas_actividades_limpias, utc=True).dt.strftime("%Y%m%d%H").astype(int)
+            print(f"post, insetar tiempo_id", len(df_neo_nuevo))
+            # Cruces relacionales contra los catálogos completos actualizados del DWH
+            for col in ['pais', 'region', 'ciudad']:
+                if col in df_neo_nuevo.columns:
+                    df_neo_nuevo[col] = df_neo_nuevo[col].astype(str).str.strip().str.lower()
+                if col in df_geografia_unificada_completa.columns:
+                    df_geografia_unificada_completa[col] = df_geografia_unificada_completa[col].astype(str).str.strip().str.lower()
+            df_act_mapeada = df_neo_nuevo.merge(df_geografia_unificada_completa, on=['pais', 'region', 'ciudad'], how='left')
+            df_act_mapeada = df_act_mapeada.merge(dim_dispositivo_completa, left_on="dispositivo", right_on="tipo", how="left")
+            print(f"post, merge.dim_dispositvo", len(df_act_mapeada))
+            df_act_mapeada = df_act_mapeada.merge(dim_tipo_actividad_completa, left_on="tipo_actividad", right_on="descripcion", how="left")
+            print(f"post, merge.dim_tipo_actividad", len(df_act_mapeada))
+
+            hechos_actividad = df_act_mapeada[[
+                "id_actividad", "id_usuario_fk", "id_publicacion_fk", "id_tiempo_fk",
+                "id_geografia", "id_dispositivo", "id_tipo_actividad",
+                "pais", "region", "ciudad", "codigo_iso" 
+            ]].rename(columns={
+                "id_geografia": "id_geografia_fk",
+                "id_dispositivo": "id_dispositivo_fk", 
+                "id_tipo_actividad": "id_tipo_actividad_fk"
+            })
+            
+            hechos_actividad = hechos_actividad.drop_duplicates(subset=["id_actividad", "id_publicacion_fk", "id_geografia_fk"])
+            hechos_actividad["id_geografia_fk"] = pd.to_numeric(hechos_actividad["id_geografia_fk"], errors="coerce").astype("Int64")            
+            df_errores_geo = hechos_actividad[hechos_actividad["id_geografia_fk"].isna()].copy()
+            
+            if not df_errores_geo.empty:
+                print(f"⚠️ [AUDITORÍA] Se encontraron {len(df_errores_geo)} filas con geografía vacía (NaN). Subiendo a tabla de prueba...")
+                
+                # Seleccionamos columnas clave para investigar qué combinaciones de texto fallaron
+                df_reporte_error = df_errores_geo[[
+                    "id_actividad", "id_usuario_fk", "id_publicacion_fk", "pais", "region", "ciudad", "codigo_iso"
+                ]]
+                
+                # 2. Lo subimos a una tabla nueva llamada 'prueba_errores_geo'. 
+                # Usamos if_exists='replace' para que en cada corrida se limpie y veas solo los errores actuales.
+                df_reporte_error.to_sql(
+                    "prueba_errores_geo", 
+                    con=conn_dwh, 
+                    if_exists="replace", 
+                    index=False
+                )
+                print("✅ [AUDITORÍA] Tabla 'prueba_errores_geo' actualizada en Supabase. ¡Revisala para ver qué textos fallaron!")
+            else:
+                print("🎉 [AUDITORÍA] ¡Excelente! No se detectaron filas con geografía NaN.")
+            hechos_actividad = hechos_actividad.dropna(subset=["id_usuario_fk", "id_publicacion_fk","id_geografia_fk"])
+            hechos_actividad["id_geografia_fk"] = hechos_actividad["id_geografia_fk"].astype(int)
+            hechos_actividad = hechos_actividad.drop(columns=["pais", "region", "ciudad"], errors="ignore")           
+            publicaciones_validas = df_publicacion_completa["id_publicacion"].unique()
+            hechos_actividad_filtrada = hechos_actividad[hechos_actividad["id_publicacion_fk"].isin(publicaciones_validas)]
+            if not hechos_actividad_filtrada.empty:
+                hechos_actividad_filtrada.to_sql("actividad", con=conn_dwh, if_exists="append", index=False)
+                print(f"  🚀 [HECHOS] Se añadieron {len(hechos_actividad_filtrada)} interacciones de actividad nuevas.")
+            else:
+                print("  📊 [HECHOS] Las actividades nuevas no superaron el filtro de integridad relacional.")
+        else:
+            print("  📊 [HECHOS] No se detectaron interacciones de actividad nuevas.")
+             
+        conn_dwh.commit()
+
+    print("\n✅ [INCREMENTAL ETL COMPLETE] ¡DWH sincronizado exitosamente en Supabase!")
+
+if __name__ == "__main__":
+    etl_creacion()
