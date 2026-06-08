@@ -113,14 +113,14 @@ def etl_creacion():
         filas_nuevas_mascara = df_geo_merge['id_geografia_old'].isna()
         
         if filas_nuevas_mascara.any():
-            max_id_geo = geo_viejas_df['id_geografia'].max()
+            max_id_geo = geo_viejas_df['id_geografia'].max() if not geo_viejas_df.empty else 0
             cantidad_nuevas = filas_nuevas_mascara.sum()
             
             df_geo_merge.loc[filas_nuevas_mascara, 'id_geografia'] = range(
                 int(max_id_geo) + 1, 
                 int(max_id_geo) + 1 + cantidad_nuevas
             )
-            
+        
             df_geo_nuevo = df_geo_merge[filas_nuevas_mascara].copy()
                   
             df_geo_nuevo = df_geo_nuevo[['id_geografia', 'pais', 'region', 'ciudad', 'codigo_iso']]
@@ -133,10 +133,10 @@ def etl_creacion():
         fechas_actividades_limpias = df_neo["fecha_actividad"].apply(
             lambda x: x.to_native() if hasattr(x, "to_native") else x
         )
-        fechas_actividades = pd.to_datetime(fechas_actividades_limpias, utc=True)
-        
-        todas_las_fechas = pd.concat([fechas_facturas, fechas_actividades]).dropna()
-        todas_las_fechas = pd.to_datetime(todas_las_fechas, utc=True)
+
+        todas_las_fechas = pd.concat([fechas_facturas, fechas_actividades_limpias]).dropna()
+        fechas_facturas = pd.to_datetime(fechas_facturas, utc=True)
+
         fechas_truncadas = todas_las_fechas.dt.floor("h").drop_duplicates()    
         
         dim_tiempo_candidata = pd.DataFrame({
@@ -165,8 +165,7 @@ def etl_creacion():
             print(f"Se cargaron {len(dim_dispositivo_nuevo)} dispositivos nuevos")
             dim_dispositivo_nuevo.to_sql("dispositivo", con=conn_dwh, if_exists="append", index=False)
 
-        dim_dispositivo_completa = pd.read_sql(text("SELECT id_dispositivo, tipo FROM dispositivo"), con=conn_dwh)
-
+        
         dim_tipo_viejos = pd.read_sql(text("SELECT descripcion FROM tipo_actividad"), con=conn_dwh)["descripcion"].tolist()
         nuevas_actividades = [a.lower() for a in df_neo["tipo_actividad"].dropna().unique() if a.lower() not in dim_tipo_viejos]
         if nuevas_actividades:
@@ -182,8 +181,7 @@ def etl_creacion():
             df_mongo_nuevo.to_sql("publicacion", schema="public", con=conn_dwh, if_exists="append", index=False)
             print(f"Se cargaron {len(df_mongo_nuevo)} publicaciones nuevas")
             
-        df_publicacion_completa = pd.read_sql(text("SELECT id_publicacion FROM publicacion"), con=conn_dwh)
-
+        #Tabla de hechos
         facturas_viejas = pd.read_sql("SELECT id_factura FROM factura", con=conn_dwh)["id_factura"].tolist()
         df_factura_nueva = df_factura[~df_factura["id_factura"].isin(facturas_viejas)].copy()
         
@@ -197,17 +195,20 @@ def etl_creacion():
             print(f"Se cargaron {len(hechos_factura)} facturas nuevas")
 
 
-        #Hechos
         dim_tipo_actividad_completa = pd.read_sql(text("SELECT id_tipo_actividad, descripcion FROM tipo_actividad"), con=conn_dwh)
         df_geografia_unificada_completa = pd.read_sql(text("SELECT id_geografia, pais, region, ciudad FROM geografia"), con=conn_dwh)
         dim_dispositivo_completa = pd.read_sql(text("SELECT id_dispositivo, tipo FROM dispositivo"), con=conn_dwh)
         actividades_viejas = pd.read_sql(text("SELECT id_actividad FROM actividad"), con=conn_dwh)["id_actividad"].tolist()
+
         df_neo_nuevo = df_neo[~df_neo["id_actividad"].isin(actividades_viejas)].copy()
         if not df_neo_nuevo.empty:
             df_neo_nuevo["tipo_actividad"] = df_neo_nuevo["tipo_actividad"].str.lower()
+            fechas_actividades_limpias = df_neo["fecha_actividad"].apply(
+                lambda x: x.to_native() if hasattr(x, "to_native") else x
+            )
             df_neo_nuevo["id_tiempo_fk"] = pd.to_datetime(fechas_actividades_limpias, utc=True).dt.strftime("%Y%m%d%H").astype(int)
             for col in ['pais', 'region', 'ciudad']:
-                df_neo_nuevo[col] = df_neo_nuevo[col].astype(str).str.strip().str.lower() if 'df_neo_nuevo' in locals() else df_neo[col].astype(str).str.strip().str.lower()         
+                df_neo_nuevo[col] = df_neo_nuevo[col].astype(str).str.strip().str.lower()         
             df_act_mapeada = df_neo_nuevo.merge(df_geografia_unificada_completa, on=['pais', 'region', 'ciudad'], how='left')
             df_act_mapeada = df_act_mapeada.merge(dim_dispositivo_completa, left_on="dispositivo", right_on="tipo", how="left")
             df_act_mapeada = df_act_mapeada.merge(dim_tipo_actividad_completa, left_on="tipo_actividad", right_on="descripcion", how="left")
@@ -223,12 +224,7 @@ def etl_creacion():
             })
             
             hechos_actividad = hechos_actividad.drop_duplicates(subset=["id_actividad"])
-
-
-            hechos_actividad["id_geografia_fk"] = hechos_actividad["id_geografia_fk"].fillna(1)
-            hechos_actividad["id_geografia_fk"] = pd.to_numeric(hechos_actividad["id_geografia_fk"], errors="coerce").astype("Int64")
-
-            #hechos_actividad["id_geografia_fk"] = hechos_actividad["id_geografia_fk"].astype(int)           
+            df_publicacion_completa = pd.read_sql(text("SELECT id_publicacion FROM publicacion"), con=conn_dwh)
             publicaciones_validas = df_publicacion_completa["id_publicacion"].unique()
             hechos_actividad_filtrada = hechos_actividad[hechos_actividad["id_publicacion_fk"].isin(publicaciones_validas)]
             if not hechos_actividad_filtrada.empty:
