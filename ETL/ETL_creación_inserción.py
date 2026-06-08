@@ -203,9 +203,6 @@ def etl_creacion():
         df_neo_nuevo = df_neo[~df_neo["id_actividad"].isin(actividades_viejas)].copy()
         if not df_neo_nuevo.empty:
             df_neo_nuevo["tipo_actividad"] = df_neo_nuevo["tipo_actividad"].str.lower()
-            fechas_actividades_limpias = df_neo["fecha_actividad"].apply(
-                lambda x: x.to_native() if hasattr(x, "to_native") else x
-            )
             df_neo_nuevo["id_tiempo_fk"] = pd.to_datetime(fechas_actividades_limpias, utc=True).dt.strftime("%Y%m%d%H").astype(int)
             for col in ['pais', 'region', 'ciudad']:
                 df_neo_nuevo[col] = df_neo_nuevo[col].astype(str).str.strip().str.lower()         
