@@ -103,22 +103,28 @@ def etl_creacion():
         df_neo[['pais', 'region', 'ciudad', 'codigo_iso']] = [
             obtener_geografia_offline(lat, lon) for lat, lon in zip(df_neo['latitud'], df_neo['longitud'])
         ]
-        df_geo_neo4j_final = df_neo[['pais', 'region', 'ciudad', 'codigo_iso']].drop_duplicates().copy()
-        
+        df_geo_neo4j_final = df_neo[['pais', 'region', 'ciudad', "codigo_iso"]].copy()
         df_geografia_unificada= pd.concat([df_geografia, df_geo_neo4j_final], ignore_index=True)
-
-        df_geografia_unificada.drop_duplicates(subset=['pais', 'region', 'ciudad', 'codigo_iso'], inplace=True)
-        geo_viejas_df = pd.read_sql(text("SELECT id_geografia, pais, region, ciudad FROM geografia"), con=conn_dwh)
+        for col in ['pais', 'region', 'ciudad']:
+            df_geografia_unificada[col] = df_geografia_unificada[col].astype(str).str.strip().str.lower()
+        df_geografia_unificada.drop_duplicates(subset=['pais', 'region', 'ciudad'], inplace=True)
+        geo_viejas_df = pd.read_sql(text("SELECT id_geografia, pais, region, ciudad, codigo_iso FROM geografia"), con=conn_dwh)
         df_geo_merge = df_geografia_unificada.merge(geo_viejas_df, on=['pais', 'region', 'ciudad'], how='left', suffixes=('', '_old'))
-        df_geo_nuevo = df_geo_merge[df_geo_merge['id_geografia'].isna()].copy()
-        if not df_geo_nuevo.empty:
-            if 'id_geografia' in df_geo_nuevo.columns:
-                df_geo_nuevo.drop(columns=['id_geografia'], inplace=True)
-            geo_viejas_sin_comodin = geo_viejas_df[geo_viejas_df['id_geografia'] != 1]
-            max_id_geo = geo_viejas_sin_comodin['id_geografia'].max() if not geo_viejas_sin_comodin.empty else 1
-            df_geo_nuevo.insert(0, 'id_geografia', range(int(max_id_geo)+1, int(max_id_geo)+ 1 + len(df_geo_nuevo)))
+        filas_nuevas_mascara = df_geo_merge['id_geografia_old'].isna()
+        
+        if filas_nuevas_mascara.any():
+            max_id_geo = geo_viejas_df['id_geografia'].max()
+            cantidad_nuevas = filas_nuevas_mascara.sum()
+            
+            df_geo_merge.loc[filas_nuevas_mascara, 'id_geografia'] = range(
+                int(max_id_geo) + 1, 
+                int(max_id_geo) + 1 + cantidad_nuevas
+            )
+            
+            df_geo_nuevo = df_geo_merge[filas_nuevas_mascara].copy()
+                  
             df_geo_nuevo = df_geo_nuevo[['id_geografia', 'pais', 'region', 'ciudad', 'codigo_iso']]
-            print(f"Se carrgaron {len(df_geo_nuevo)} geografías nuevas")
+            print(f"Se cargaron {len(df_geo_nuevo)} geografías nuevas")
             df_geo_nuevo.to_sql("geografia", con=conn_dwh, if_exists="append", index=False)
 
         
@@ -170,7 +176,6 @@ def etl_creacion():
             dim_tipo_nuevo.to_sql("tipo_actividad", con=conn_dwh, if_exists="append", index=False)
             print(f"Se cargaron {len(dim_tipo_nuevo)} tipos de actividad nuevos")
             
-        dim_tipo_actividad_completa = pd.read_sql(text("SELECT id_tipo_actividad, descripcion FROM tipo_actividad"), con=conn_dwh)
         publicaciones_viejas = pd.read_sql(text("SELECT id_publicacion FROM publicacion"), con=conn_dwh)["id_publicacion"].tolist()
         df_mongo_nuevo = df_mongo[~df_mongo["id_publicacion"].isin(publicaciones_viejas)].drop_duplicates(subset=["id_publicacion"])
         if not df_mongo_nuevo.empty:
@@ -193,18 +198,16 @@ def etl_creacion():
 
 
         #Hechos
+        dim_tipo_actividad_completa = pd.read_sql(text("SELECT id_tipo_actividad, descripcion FROM tipo_actividad"), con=conn_dwh)
         df_geografia_unificada_completa = pd.read_sql(text("SELECT id_geografia, pais, region, ciudad FROM geografia"), con=conn_dwh)
-        df_geografia_unificada_completa = df_geografia_unificada_completa.drop_duplicates(subset=['pais', 'region', 'ciudad'], keep='first')
+        dim_dispositivo_completa = pd.read_sql(text("SELECT id_dispositivo, tipo FROM dispositivo"), con=conn_dwh)
         actividades_viejas = pd.read_sql(text("SELECT id_actividad FROM actividad"), con=conn_dwh)["id_actividad"].tolist()
         df_neo_nuevo = df_neo[~df_neo["id_actividad"].isin(actividades_viejas)].copy()
         if not df_neo_nuevo.empty:
             df_neo_nuevo["tipo_actividad"] = df_neo_nuevo["tipo_actividad"].str.lower()
-            df_neo_nuevo["id_tiempo_fk"] = pd.to_datetime(fechas_actividades_limpias, utc=True).dt.strftime("%Y%m%d%H").astype(int)           
+            df_neo_nuevo["id_tiempo_fk"] = pd.to_datetime(fechas_actividades_limpias, utc=True).dt.strftime("%Y%m%d%H").astype(int)
             for col in ['pais', 'region', 'ciudad']:
-                if col in df_neo_nuevo.columns:
-                    df_neo_nuevo[col] = df_neo_nuevo[col].astype(str).str.strip().str.lower()
-                if col in df_geografia_unificada_completa.columns:
-                    df_geografia_unificada_completa[col] = df_geografia_unificada_completa[col].astype(str).str.strip().str.lower()
+                df_neo_nuevo[col] = df_neo_nuevo[col].astype(str).str.strip().str.lower() if 'df_neo_nuevo' in locals() else df_neo[col].astype(str).str.strip().str.lower()         
             df_act_mapeada = df_neo_nuevo.merge(df_geografia_unificada_completa, on=['pais', 'region', 'ciudad'], how='left')
             df_act_mapeada = df_act_mapeada.merge(dim_dispositivo_completa, left_on="dispositivo", right_on="tipo", how="left")
             df_act_mapeada = df_act_mapeada.merge(dim_tipo_actividad_completa, left_on="tipo_actividad", right_on="descripcion", how="left")
